@@ -1,0 +1,569 @@
+---
+title: "Predictive analysis of client subscribed for term deposit"
+author: "Fox325"
+date: "6/11/2021"
+output:
+  word_document: default
+  html_document: default
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,message = FALSE,warning = FALSE)
+library(tidyverse)
+library(tidymodels)
+library(lubridate)
+theme_update(plot.title = element_text(hjust = .5))
+library(pander)
+doParallel::registerDoParallel(cores = 6)
+df <- read_delim("bank.csv",delim = ";")
+```
+
+## Basic data exploration.
+```{r}
+skimr::skim(df)
+```
+This dataset consist of 17 variables with 4521 observations. Among this 17 variables; 7 are numeric and 10 are character variables.
+
+### Short discription about the variables
+ - age (numeric)
+ - job : type of job (categorical)
+ - marital : marital status (categorical)
+ - education (categorical)
+ - default: has credit in default? (binary)
+ - balance: average yearly balance, in euros (numeric)
+ - housing: has housing loan? (binary)
+ - loan: has personal loan? (binary)
+ - contact: contact communication type (categorical)
+ - day: last contact day of the month (numeric)
+ - month: last contact month of year (categorical)
+ - duration: last contact duration, in seconds (numeric)
+ - campaign: number of contacts performed during this campaign and for this client (numeric)
+ - pdays: number of days that passed by after the client was last contacted from a previous campaign (numeric, -1 means client was not previously contacted)
+ - previous: number of contacts performed before this campaign and for this client (numeric)
+ - poutcome: outcome of the previous marketing campaign (categorical)
+
+Output variable (desired target):
+    - y - has the client subscribed a term deposit? (binary: "yes","no")
+
+```{r}
+head(df) %>% 
+    pander()
+```
+
+
+### Data cleaning and feature engineering.
+```{r}
+df <-df %>% 
+    unite("date",day:month,sep = "-") %>% 
+    mutate(date = paste0(date,"-2020"),
+           date = dmy(date),
+           date = dmy("31-12-2020")-date,
+           date = as.numeric(date),
+           pdays = ifelse(pdays == -1,900,pdays),
+           y = factor(y,c("no","yes"))) %>% 
+    mutate_if(is.character,as.factor)
+```
+In this tase we unite the day and month variable together and then find the distance between days from decamber 31 and replace the value of -1 for variable pdays by 900. After the cleaning stuffs the data set become. Then change all the character variable type to the factor type.
+
+```{r}
+df %>% 
+    head() %>% 
+    pander()
+```
+
+### Explonatory data analysis
+```{r}
+df %>% 
+    ggplot(aes(age,fill = y)) +
+    geom_density()+
+    labs(title = "Histogram of age with respect to subscribed a term deposit") +
+    scale_fill_viridis_d(alpha = .7)
+```
+So for the higher age group the tendency of subscribed a term deposit is higher.
+
+```{r}
+df %>% 
+    group_by(job) %>% 
+    count(y) %>% 
+    mutate(prop= n/sum(n)) %>% 
+    filter(y == "yes") %>% 
+    ungroup() %>% 
+    mutate(job = reorder(job,prop)) %>% 
+    ggplot(aes(y=job,prop)) +
+    geom_col(col="darkgreen",fill="lightgreen") +
+    scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+    labs(title = "Pecentage of subscribed a term deposit \naccording to job type.",x="percentage",y="")
+```
+So student and retired people use to subscribed a term deposit more in percentage than other people.
+
+```{r}
+df %>% 
+    select(marital:contact,poutcome,y,-balance) %>% 
+    pivot_longer(-y) %>% 
+    group_by(name,value) %>% 
+    count(y) %>% 
+    mutate(prop = n/sum(n)) %>% 
+    filter(y == "yes") %>% 
+    ungroup() %>% 
+    mutate(value = tidytext::reorder_within(value,by = -prop,within = name)) %>% 
+    ggplot(aes(value,prop)) +
+    geom_col(col = "darkgreen",fill = "lightgreen")+
+    tidytext::scale_x_reordered()+
+    facet_wrap(~name,scales = "free",ncol = 2) +
+    scale_y_continuous(label= scales::percent_format(accuracy = 1)) +
+  labs(title = "Barplot for the categorical variables of the dataset",y="",x="")
+```
+So from this graph we can see that the percentage of subscribed of term deposit increase for the contact variable telephone and cellular group; education variable tertiary group; housing variable no group; loan variable no group; marital variable divorced and single group; poutcome variable success group.
+
+```{r}
+df %>% 
+    select(balance,date, duration, pdays,y) %>% 
+    pivot_longer(-y) %>% 
+    ggplot(aes(value,fill = y)) +
+    geom_density()+
+    facet_wrap(~name,ncol = 1,scales = "free")+
+    scale_x_log10()+
+    scale_fill_viridis_d(alpha = .7) +
+    labs(title = "Histogram of balance, date, duration and pdays \nwith respect to subscribed a term deposit")
+```
+From this plot we can see that lower values for balance, date and duration variables has less odds to subscribed a term deposit. On the other hand lower value of variable pdays has higer oddas to subscribe a term deposit.
+
+
+### Models
+We will fit some models like
+    - Logistic Regression
+    - Elastic net
+    - Decision Tree
+    - Random Forest
+    - Xgboost
+
+### Class imbalance
+```{r}
+df %>% 
+    count(y) %>% 
+    pander()
+```
+This data set has a class imbalance problem. We will down sample the no class to reduce the effect.
+```{r}
+df <- df %>% 
+    recipe(y~.) %>% 
+    step_downsample(y,under_ratio = 1.2, seed = 1234) %>% 
+    prep() %>% 
+    bake(NULL)
+
+df %>% 
+    count(y) %>% 
+    pander()
+```
+After this down sample our sample size become 1146 in which no group has 625 observations and yes group has 521 observations.
+
+### Spliting data into train and test set
+```{r}
+set.seed(10)
+df_split <- initial_split(df,.8)
+df_train <- training(df_split)
+```
+We have 1146 observations in our data set we will split the data in 80% train and 20% test set we get 916 observation in the train set and 230 observations in the test set.
+
+### Preprocessing of the data
+```{r}
+lr_rec <-
+    df_train %>% 
+    recipe(y~ .) %>% 
+    step_normalize(all_numeric()) %>% 
+    step_dummy(all_nominal(),-all_outcomes()) %>%
+    prep()
+
+tree_rec <- 
+    df_train %>% 
+    recipe(y~.) %>% 
+    prep()
+```
+
+Before fitting those data to the model we need to pre-processing. For logistic regression, elasticnet regression we need to scale the numeric data and make the categorical variable to dummy variable. For the tree based model we don't need any type of pre-processing.
+
+### Hyper-parameters
+It is necessary to find out the optimal value of the hyper-parameter to ensure the maximum performance by the model. So for this task we use 10 fold cross validation and we randomly choose some hyper-parameter values in the parameter space and then find out that which set is performing the best. Then we select the values of the hyper-parameter set and fit our model on the full training dataset on this settings.
+
+```{r}
+lr_specs <- 
+    logistic_reg(mode = "classification") %>% 
+    set_engine("glm")
+
+enet_specs <- 
+    logistic_reg(mode = "classification",penalty = tune(),mixture = tune()) %>% 
+    set_engine("glmnet")
+
+tree_specs <- 
+    decision_tree(mode = "classification",cost_complexity = tune(),tree_depth = tune(),min_n = tune()) %>% 
+    set_engine("rpart")
+
+rf_specs <- 
+    rand_forest(mode = "classification",trees = 1000,min_n = tune()) %>% 
+    set_engine("ranger")
+
+xgb_specs <- 
+    boost_tree(mode = "classification",trees = 1000,min_n = tune(),learn_rate = tune(),tree_depth = tune()) %>% 
+    set_engine("xgboost")
+```
+
+```{r}
+set.seed(10)
+df_cv <- vfold_cv(df_train)
+```
+
+While we are using different types of models all models expect logistic regression has hyper-parameters. We will use 10 fold cross validation to tune those hyper-parameters. 
+```{r}
+model_fitting <-
+    function(name = "lr",model = enet_specs, recipe = lr_rec) {
+        
+        if (name != "logistic Regression") {
+            set.seed(1234)
+            parms_grid <-
+                model %>%
+                parameters() %>%
+                grid_latin_hypercube(size = 10 * nrow(.))
+            
+            wf <-
+                workflow() %>%
+                add_model(model) %>%
+                add_recipe(recipe)
+            
+            resample_results <-
+                tune_grid(
+                    object = wf,
+                    grid = parms_grid,
+                    resamples = df_cv,
+                    metrics = metric_set(accuracy)
+                )
+            
+            fit <-
+                wf %>%
+                finalize_workflow(select_best(resample_results)) %>%
+                fit(df_train)
+        }
+        
+        else
+            fit <-
+                workflow() %>%
+                add_model(model) %>%
+                add_formula(y ~ .) %>% 
+                fit(df_train)
+        
+        print(name)
+        return(fit)
+    }
+```
+
+
+```{r}
+# fit <-
+#     tibble(id = 1:5) %>%
+#     mutate(
+#         name = c(
+#             "logistic Regression",
+#             "Elastic net",
+#             "Decision tree",
+#             "Randomfprest",
+#             "Xg boost"
+#         ),
+#         model = list(lr_specs, enet_specs, tree_specs, rf_specs, xgb_specs),
+#         recipe = list(lr_rec, lr_rec, tree_rec, tree_rec, lr_rec),
+#         fit = pmap(
+#             list(name, model, recipe),
+#             ~ model_fitting(
+#                 name = ..1,
+#                 model = ..2,
+#                 recipe = ..3
+#             )
+#         )
+#     )
+# 
+# fit <-
+#     fit %>%
+#     transmute(
+#         name,
+#         fit,
+#         split = list(df_split),
+#         last_fit = map2(
+#             fit,
+#             split,
+#             ~ last_fit(.x, .y))
+#     )
+# 
+# fit %>%
+#     select(-c(fit,split)) %>%
+#     unnest(last_fit) %>%
+#     unnest(.predictions) %>%
+#     select(name,.pred_no,y) %>%
+#     group_by(name) %>%
+#     roc_curve(truth = y, .pred_no) %>%
+#     autoplot()
+```
+From this plot we can see that all model perform equally. no we will check for the numerical evidence.
+
+```{r}
+# fit %>%
+#   select(-c(fit, split)) %>%
+#   unnest(last_fit) %>%
+#   unnest(.predictions) %>%
+#   select(name, .pred_no, y) %>%
+#   group_by(name) %>%
+#   roc_auc(truth = y, .pred_no) %>%
+#   arrange(-.estimate) %>%
+#   pander()
+```
+From this we can say that the area under curve for the random forest model is maximum. hence our selected model is random forest. 
+
+### Performance metric for random forest
+```{r}
+# fit$fit[[4]] %>%
+#   augment(testing(df_split)) %>%
+#   accuracy(truth = y,.pred_class) %>%
+#   bind_rows(fit$fit[[4]] %>%
+#   augment(testing(df_split)) %>%
+#   precision(truth = y,.pred_class)) %>%
+#   bind_rows(fit$fit[[4]] %>%
+#   augment(testing(df_split)) %>%
+#   recall(truth = y,.pred_class)) %>%
+#   pander()
+```
+So from this table we can see that the accuracy of the random forest model is .8 that is it can identify 80% of the cases correctly. The precision is .87 that is 87% of the cases classified as "yes" by the model is correct. The recall is .797 that is about 80% of all true "yes" class can be classified correctly by the model.
+
+
+
+### Appendix
+`
+##Basic data exploration.
+skimr::skim(df)
+
+##Data cleaning
+df <-df %>% 
+    unite("date",day:month,sep = "-") %>% 
+    mutate(date = paste0(date,"-2020"),
+           date = dmy(date),
+           date = dmy("31-12-2020")-date,
+           date = as.numeric(date),
+           pdays = ifelse(pdays == -1,900,pdays),
+           y = factor(y,c("no","yes"))) %>% 
+    mutate_if(is.character,as.factor)
+
+##Explonatory data analysis
+df %>% 
+    ggplot(aes(age,fill = y)) +
+    geom_density()+
+    labs(title = "Histogram of age with respect to subscribed a term deposit") +
+    scale_fill_viridis_d(alpha = .7)
+    
+df %>% 
+    group_by(job) %>% 
+    count(y) %>% 
+    mutate(prop= n/sum(n)) %>% 
+    filter(y == "yes") %>% 
+    ungroup() %>% 
+    mutate(job = reorder(job,prop)) %>% 
+    ggplot(aes(y=job,prop)) +
+    geom_col(col="darkgreen",fill="lightgreen") +
+    scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+    labs(title = "Pecentage of subscribed a term deposit \naccording to job type.",x="percentage",y="")
+    
+df %>% 
+    select(marital:contact,poutcome,y,-balance) %>% 
+    pivot_longer(-y) %>% 
+    group_by(name,value) %>% 
+    count(y) %>% 
+    mutate(prop = n/sum(n)) %>% 
+    filter(y == "yes") %>% 
+    ungroup() %>% 
+    mutate(value = tidytext::reorder_within(value,by = -prop,within = name)) %>% 
+    ggplot(aes(value,prop)) +
+    geom_col(col = "darkgreen",fill = "lightgreen")+
+    tidytext::scale_x_reordered()+
+    facet_wrap(~name,scales = "free",ncol = 2) +
+    scale_y_continuous +
+  labs(title = "Barplot for the categorical variables of the dataset")
+  
+df %>% 
+    select(balance,date, duration, pdays,y) %>% 
+    pivot_longer(-y) %>% 
+    ggplot(aes(value,fill = y)) +
+    geom_density()+
+    facet_wrap(~name,ncol = 1,scales = "free")+
+    scale_x_log10()+
+    scale_fill_viridis_d(alpha = .7) +
+    labs(title = "Histogram of balance, date, duration and pdays \nwith respect to subscribed a term deposit")
+    
+##Class imbalance
+df %>% 
+    count(y) %>% 
+    pander()
+    
+##Model specifications
+lr_specs <- 
+    logistic_reg(mode = "classification") %>% 
+    set_engine("glm")
+
+enet_specs <- 
+    logistic_reg(mode = "classification",penalty = tune(),mixture = tune()) %>% 
+    set_engine("glmnet")
+
+tree_specs <- 
+    decision_tree(mode = "classification",cost_complexity = tune(),tree_depth = tune(),min_n = tune()) %>% 
+    set_engine("rpart")
+
+rf_specs <- 
+    rand_forest(mode = "classification",trees = 1000,min_n = tune()) %>% 
+    set_engine("ranger")
+
+xgb_specs <- 
+    boost_tree(mode = "classification",trees = 1000,min_n = tune(),learn_rate = tune(),tree_depth = tune()) %>% 
+    set_engine("xgboost")
+
+##Cross validation
+set.seed(10)
+df_cv <- vfold_cv(df_train)
+
+##Function for model fitting
+model_fitting <-
+    function(name = "lr",model = enet_specs, recipe = lr_rec) {
+        
+        if (name != "logistic Regression") {
+            set.seed(1234)
+            parms_grid <-
+                model %>%
+                parameters() %>%
+                grid_latin_hypercube(size = 10 * nrow(.))
+            
+            wf <-
+                workflow() %>%
+                add_model(model) %>%
+                add_recipe(recipe)
+            
+            resample_results <-
+                tune_grid(
+                    object = wf,
+                    grid = parms_grid,
+                    resamples = df_cv,
+                    metrics = metric_set(accuracy)
+                )
+            
+            fit <-
+                wf %>%
+                finalize_workflow(select_best(resample_results)) %>%
+                fit(df_train)
+        }
+        
+        else
+            fit <-
+                workflow() %>%
+                add_model(model) %>%
+                add_formula(y ~ .) %>% 
+                fit(df_train)
+        
+        print(name)
+        return(fit)
+    }
+    
+##Fitting the model
+fit <-
+    tibble(id = 1:5) %>%
+    mutate(
+        name = c(
+            "logistic Regression",
+            "Elastic net",
+            "Decision tree",
+            "Randomfprest",
+            "Xg boost"
+        ),
+        model = list(lr_specs, enet_specs, tree_specs, rf_specs, xgb_specs),
+        recipe = list(lr_rec, lr_rec, tree_rec, tree_rec, lr_rec),
+        fit = pmap(
+            list(name, model, recipe),
+            ~ model_fitting(
+                name = ..1,
+                model = ..2,
+                recipe = ..3
+            )
+        )
+    )
+
+fit <-
+    fit %>%
+    transmute(
+        name,
+        fit,
+        split = list(df_split),
+        last_fit = map2(
+            fit,
+            split,
+            ~ last_fit(.x, .y))
+    )
+
+##Plotting roc-auc
+fit %>%
+    select(-c(fit,split)) %>%
+    unnest(last_fit) %>%
+    unnest(.predictions) %>%
+    select(name,.pred_no,y) %>%
+    group_by(name) %>%
+    roc_curve(truth = y, .pred_no) %>%
+    autoplot()
+    
+##Roc-auc table
+fit %>%
+  select(-c(fit, split)) %>%
+  unnest(last_fit) %>%
+  unnest(.predictions) %>%
+  select(name, .pred_no, y) %>%
+  group_by(name) %>%
+  roc_auc(truth = y, .pred_no) %>%
+  arrange(-.estimate) %>%
+  pander()
+  
+##Random forest performance
+fit$fit[[4]] %>%
+  augment(testing(df_split)) %>%
+  accuracy(truth = y,.pred_class) %>%
+  bind_rows(fit$fit[[4]] %>%
+  augment(testing(df_split)) %>%
+  precision(truth = y,.pred_class)) %>%
+  bind_rows(fit$fit[[4]] %>%
+  augment(testing(df_split)) %>%
+  recall(truth = y,.pred_class)) %>%
+  pander()
+`
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
